@@ -1,92 +1,63 @@
 import cv2
 import numpy as np
-from dataclasses import dataclass, asdict
-from typing import Optional
-from ultralytics import YOLO
+from PIL import Image
+import io
+import math
 
-PRETRAINED_MODEL_ID = "keremberke/yolov8n-floor-plan-detection"
-_model_cache: Optional[YOLO] = None
-
-@dataclass
-class WallSegment:
-    x1: int; y1: int
-    x2: int; y2: int
-    angle: str
-    length_px: int
-
-@dataclass
-class FloorObject:
-    cls: str
-    x: int; y: int
-    w: int; h: int
-    confidence: float
-
-def _get_model() -> YOLO:
-    global _model_cache
-    if _model_cache is None:
-        from huggingface_hub import hf_hub_download
-        ckpt = hf_hub_download(repo_id=PRETRAINED_MODEL_ID, filename="best.pt")
-        _model_cache = YOLO(ckpt)
-    return _model_cache
-
-def preprocess(image_path: str):
-    img = cv2.imread(image_path)
-    if img is None:
-        raise ValueError(f"Imagem não encontrada: {image_path}")
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    binary = cv2.adaptiveThreshold(
-        gray, 255,
+def preprocess(img_array: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    thresh = cv2.adaptiveThreshold(
+        blur, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV,
-        blockSize=11, C=2
+        11, 2
     )
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, k, iterations=2)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  k, iterations=1)
-    return img, binary
+    kernel = np.ones((2, 2), np.uint8)
+    cleaned = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    return cleaned
 
-def extract_walls(binary, min_length_px=40):
-    edges = cv2.Canny(binary, 50, 150)
-    lines = cv2.HoughLinesP(edges, 1, np.pi/360,
-                             threshold=60, minLineLength=min_length_px, maxLineGap=8)
+def extract_walls(binary: np.ndarray, orig_w: int, orig_h: int):
+    lines = cv2.HoughLinesP(
+        binary,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=80,
+        minLineLength=40,
+        maxLineGap=10
+    )
     walls = []
     if lines is None:
         return walls
     for line in lines:
-        x1, y1, x2, y2 = line[0].tolist()
-        angle = np.degrees(np.arctan2(abs(y2-y1), abs(x2-x1)))
-        if angle <= 8:
-            direction = "horizontal"
-        elif angle >= 82:
-            direction = "vertical"
-        else:
-            continue
-        walls.append(WallSegment(x1, y1, x2, y2, direction,
-                                  int(np.hypot(x2-x1, y2-y1))))
+        x1, y1, x2, y2 = line[0]
+        dx = abs(x2 - x1)
+        dy = abs(y2 - y1)
+        angle = math.atan2(dy, dx) * 180 / math.pi
+        if angle < 10 or angle > 80:  # orthogonal only
+            walls.append({
+                "x1": round(x1 / orig_w, 4),
+                "y1": round(y1 / orig_h, 4),
+                "x2": round(x2 / orig_w, 4),
+                "y2": round(y2 / orig_h, 4),
+            })
     return walls
 
-def detect_objects(image_path: str, conf=0.35):
-    model = _get_model()
-    results = model.predict(image_path, conf=conf, verbose=False)
-    objects = []
-    for r in results:
-        for box in r.boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-            objects.append(FloorObject(
-                cls=model.names[int(box.cls[0])],
-                x=x1, y=y1, w=x2-x1, h=y2-y1,
-                confidence=round(float(box.conf[0]), 3)
-            ))
-    return objects
+def extract_floorplan(image_bytes: bytes, filename: str = "") -> dict:
+    np_arr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Could not decode image")
 
-def extract_floorplan(image_path: str) -> dict:
-    img, binary = preprocess(image_path)
     h, w = img.shape[:2]
-    walls   = extract_walls(binary)
-    objects = detect_objects(image_path)
+    binary = preprocess(img)
+    walls = extract_walls(binary, w, h)
+
     return {
-        "image_width":  w,
-        "image_height": h,
-        "walls":   [asdict(wall) for wall in walls],
-        "objects": [asdict(obj)  for obj  in objects],
+        "imageWidth": w,
+        "imageHeight": h,
+        "walls": walls,
+        "doors": [],
+        "windows": [],
+        "sinks": [],
     }
